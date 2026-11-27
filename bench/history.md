@@ -22,3 +22,23 @@ Rows per simdgroup tried for the Q4_0 matmul (GPU µs per call, decode): half a 
 thread: 2 rows 113.8, 4 rows 80.0, 8 rows 91.5, 16 rows 132.2; one block per thread: 2 rows
 107.3, 4 rows 81.8, 8 rows 76.1, 16 rows 97.1. For BF16, 16 values per thread with 8 rows was
 slower (tg128 13.81) than 4 values per thread with 4 rows (15.95).
+
+## State at the end of phase 5 (2026-11-27)
+
+`lingot bench --model <file>` with the defaults (pp512, tg128, 5 repetitions, mean ± stddev),
+llama.cpp figures from bench/baseline.md.
+
+| File               | pp512          | % of llama.cpp | tg128        | % of llama.cpp | % of ceiling |
+| ------------------ | -------------- | -------------- | ------------ | -------------- | ------------ |
+| qwen3-8B-bf16.gguf | 280.84 ± 12.33 | 62 %           | 17.64 ± 0.18 | 94 %           | 74 %         |
+| qwen3-8B-q8_0.gguf | 301.17 ± 8.20  | 62 %           | 27.92 ± 1.03 | 110 %          | 61 %         |
+| qwen3-8B-q4_0.gguf | 290.26 ± 10.38 | 61 %           | 43.25 ± 0.71 | 99 %           | 50 %         |
+
+tg128 in Q4_0 is at 43.25 tokens/s: the 52 tokens/s target (60 % of the ceiling) is not met.
+
+Metal logits against the CPU backend on the 5 prompts (`ref/compare.py --ref cpu --backend
+metal`, worst error, top-1 228/228 everywhere): 0.6B BF16 7.3e-6, Q8_0 1.1e-5, Q4_0 2.1e-5;
+8B BF16 1.2e-5, Q8_0 1.3e-5, Q4_0 1.4e-5.
+
+Perplexity on the full WikiText-2 test set (584 chunks), `lingot perplexity` on Metal against
+llama-perplexity: 8B Q8_0 10.1332 vs 10.1334, 8B Q4_0 10.5275 vs 10.5275.
