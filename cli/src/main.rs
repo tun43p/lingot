@@ -24,6 +24,8 @@ enum Command {
     Inspect { file: PathBuf },
     /// Chat with a model: one answer with --prompt, interactive without
     Run(RunArgs),
+    /// Perplexity of a text file, computed like llama-perplexity
+    Perplexity(PerplexityArgs),
     /// Run a raw prompt and write every activation to a safetensors file (for ref/compare.py)
     Dump(DumpArgs),
 }
@@ -61,6 +63,21 @@ struct RunArgs {
 }
 
 #[derive(Args)]
+struct PerplexityArgs {
+    #[arg(long)]
+    model: PathBuf,
+    /// Text file, e.g. WikiText-2's wiki.test.raw
+    #[arg(short, long)]
+    file: PathBuf,
+    /// Chunk size in tokens
+    #[arg(short, long, default_value_t = 512)]
+    ctx: usize,
+    /// Only use the first N chunks [default: all]
+    #[arg(long)]
+    chunks: Option<usize>,
+}
+
+#[derive(Args)]
 struct DumpArgs {
     #[arg(long)]
     model: PathBuf,
@@ -80,6 +97,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Inspect { file } => inspect(&file),
         Command::Run(args) => run(&args),
+        Command::Perplexity(args) => perplexity(&args),
         Command::Dump(args) => dump(&args),
     }
 }
@@ -186,6 +204,63 @@ fn run(args: &RunArgs) -> Result<()> {
             _ => return Ok(()),
         }
     }
+}
+
+/// Same method as llama-perplexity: the text is cut into chunks of `ctx` tokens, each chunk is
+/// evaluated from an empty context, and only the second half of each chunk is scored (the
+/// tokens at positions ctx/2 + 1 .. ctx - 1, given everything before them).
+fn perplexity(args: &PerplexityArgs) -> Result<()> {
+    let gguf = Gguf::open(&args.model)?;
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let model = Model::load(&gguf, Cpu)?;
+    let text = std::fs::read_to_string(&args.file)
+        .with_context(|| format!("reading {}", args.file.display()))?;
+    let tokens = tokenizer.encode(&text);
+
+    let n_ctx = args.ctx;
+    anyhow::ensure!(n_ctx >= 4, "--ctx must be at least 4");
+    let available = tokens.len() / n_ctx;
+    let n_chunks = args.chunks.map_or(available, |n| n.min(available));
+    anyhow::ensure!(n_chunks > 0, "the file has fewer than {n_ctx} tokens");
+    eprintln!(
+        "{} tokens, calculating perplexity over {n_chunks} chunks, n_ctx={n_ctx}",
+        tokens.len()
+    );
+
+    let first = n_ctx / 2;
+    let (mut nll, mut nll2, mut count) = (0.0f64, 0.0f64, 0usize);
+    let mut state = model.new_state(n_ctx);
+    for (i, chunk) in tokens.chunks_exact(n_ctx).take(n_chunks).enumerate() {
+        state.truncate(0);
+        // The last token of a chunk is only a target: no need to evaluate it.
+        for j in 0..n_ctx - 1 {
+            let logits = model.forward(&mut state, chunk[j], &mut |_, _| {});
+            if j < first {
+                continue;
+            }
+            // -log softmax(logits)[target], subtracting the max first.
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f64 = logits.iter().map(|l| ((l - max) as f64).exp()).sum();
+            let loss = sum.ln() - (logits[chunk[j + 1] as usize] - max) as f64;
+            nll += loss;
+            nll2 += loss * loss;
+            count += 1;
+        }
+        print!("[{}]{:.4},", i + 1, (nll / count as f64).exp());
+        std::io::stdout().flush()?;
+    }
+    println!();
+
+    let mean = nll / count as f64;
+    let ppl = mean.exp();
+    let variance = nll2 / count as f64 - mean * mean;
+    let error = if variance > 0.0 {
+        (variance / (count - 1) as f64).sqrt() * ppl
+    } else {
+        0.0
+    };
+    println!("Final estimate: PPL = {ppl:.4} +/- {error:.5}");
+    Ok(())
 }
 
 /// Tensors are named like the Hugging Face dump (ref/dump.py). Activations have one row per
