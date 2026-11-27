@@ -46,10 +46,8 @@ fn reads_qwen3_0_6b() {
     assert_eq!(t.ty, TensorType::F32);
     let data = g.data(t);
     assert_eq!(data.len(), 1024 * 4);
-    assert!(
-        data.chunks_exact(4)
-            .all(|b| f32::from_le_bytes(b.try_into().unwrap()).is_finite())
-    );
+    let (values, _) = data.as_chunks::<4>();
+    assert!(values.iter().all(|b| f32::from_le_bytes(*b).is_finite()));
 
     // Tensors are aligned, in bounds and do not overlap.
     let mut spans: Vec<_> = g
