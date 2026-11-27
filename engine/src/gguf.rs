@@ -238,7 +238,8 @@ impl Gguf {
         let data_offset = (r.pos as u64).next_multiple_of(alignment);
         let mut tensors = Vec::with_capacity(raw.len());
         for (name, dims, ty, rel) in raw {
-            let invalid = || Error::Invalid(format!("tensor `{name}` has an invalid size or offset"));
+            let invalid =
+                || Error::Invalid(format!("tensor `{name}` has an invalid size or offset"));
             let (per_block, block_bytes) = ty.block();
             let n = dims
                 .iter()
@@ -247,16 +248,31 @@ impl Gguf {
             if n % per_block != 0 || rel % alignment != 0 {
                 return Err(invalid());
             }
-            let len = (n / per_block).checked_mul(block_bytes).ok_or_else(invalid)?;
+            let len = (n / per_block)
+                .checked_mul(block_bytes)
+                .ok_or_else(invalid)?;
             let start = data_offset.checked_add(rel).ok_or_else(invalid)?;
             let end = start.checked_add(len).ok_or_else(invalid)?;
             if end > mmap.len() as u64 {
                 return Err(Error::Truncated(mmap.len()));
             }
-            tensors.push(TensorInfo { name, dims, ty, start: start as usize, len: len as usize });
+            tensors.push(TensorInfo {
+                name,
+                dims,
+                ty,
+                start: start as usize,
+                len: len as usize,
+            });
         }
 
-        Ok(Gguf { mmap, version, alignment, data_offset: data_offset as usize, metadata, tensors })
+        Ok(Gguf {
+            mmap,
+            version,
+            alignment,
+            data_offset: data_offset as usize,
+            metadata,
+            tensors,
+        })
     }
 
     pub fn get(&self, key: &str) -> Option<&Value> {
@@ -298,14 +314,21 @@ impl Qwen3Config {
     pub fn from_gguf(g: &Gguf) -> Result<Self> {
         let arch = g.require("general.architecture")?.as_str();
         if arch != Some("qwen3") {
-            return Err(Error::Invalid(format!("architecture is {arch:?}, expected \"qwen3\"")));
+            return Err(Error::Invalid(format!(
+                "architecture is {arch:?}, expected \"qwen3\""
+            )));
         }
         let int = |key: &str| -> Result<usize> {
-            let v = g.require(key)?.as_u64().ok_or_else(|| Error::Metadata(key.into()))?;
+            let v = g
+                .require(key)?
+                .as_u64()
+                .ok_or_else(|| Error::Metadata(key.into()))?;
             Ok(v as usize)
         };
         let float = |key: &str| -> Result<f32> {
-            g.require(key)?.as_f32().ok_or_else(|| Error::Metadata(key.into()))
+            g.require(key)?
+                .as_f32()
+                .ok_or_else(|| Error::Metadata(key.into()))
         };
         let tokens = "tokenizer.ggml.tokens";
         Ok(Qwen3Config {
@@ -377,7 +400,9 @@ impl<'a> Reader<'a> {
             9 => {
                 let item_ty = self.u32()?;
                 if item_ty == 9 {
-                    return Err(Error::Invalid("nested metadata arrays are not supported".into()));
+                    return Err(Error::Invalid(
+                        "nested metadata arrays are not supported".into(),
+                    ));
                 }
                 let at = self.pos;
                 let len = self.u64()?;
@@ -385,13 +410,19 @@ impl<'a> Reader<'a> {
                 if len > (self.buf.len() - self.pos) as u64 {
                     return Err(Error::Truncated(at));
                 }
-                let items = (0..len).map(|_| self.value(item_ty)).collect::<Result<Vec<_>>>()?;
+                let items = (0..len)
+                    .map(|_| self.value(item_ty))
+                    .collect::<Result<Vec<_>>>()?;
                 Value::Array(items)
             }
             10 => Value::U64(self.u64()?),
             11 => Value::I64(i64::from_le_bytes(self.array()?)),
             12 => Value::F64(f64::from_le_bytes(self.array()?)),
-            other => return Err(Error::Invalid(format!("unknown metadata value type {other}"))),
+            other => {
+                return Err(Error::Invalid(format!(
+                    "unknown metadata value type {other}"
+                )));
+            }
         })
     }
 }

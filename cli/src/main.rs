@@ -45,7 +45,14 @@ fn inspect(file: &PathBuf) -> Result<()> {
     println!("\ntensors:");
     for t in &g.tensors {
         let dims: Vec<String> = t.dims.iter().map(u64::to_string).collect();
-        println!("  {}\t{}\t{}\t{}\t{}", t.name, t.ty, dims.join("x"), t.file_offset(), t.n_bytes());
+        println!(
+            "  {}\t{}\t{}\t{}\t{}",
+            t.name,
+            t.ty,
+            dims.join("x"),
+            t.file_offset(),
+            t.n_bytes()
+        );
     }
     Ok(())
 }
