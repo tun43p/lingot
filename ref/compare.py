@@ -9,6 +9,8 @@ Runs `lingot dump` on each prompt of the reference, then compares every tensor.
 Error of a tensor = max over positions of  max|ours - ref| / max|ref|  on that position.
 
 Full reference (f32): every tensor must be within --rtol and top-1 must match everywhere.
+The greedy generation must give the same tokens; a divergence is tolerated only at a step
+where the reference's top-1 and top-2 logits are closer than --gen-gap.
 Logits-only reference (bf16): top-1 must match on at least --min-top1 of the positions.
 Top-1 matches when our argmax has the reference's max logit, so an exact tie between
 the reference's top logits is a match whichever of the tied tokens we pick.
@@ -54,6 +56,7 @@ def main():
     ap.add_argument("--ref", required=True, help="directory written by ref/dump.py")
     ap.add_argument("--rtol", type=float, default=1e-3)
     ap.add_argument("--min-top1", type=float, default=0.99)
+    ap.add_argument("--gen-gap", type=float, default=1e-3)
     args = ap.parse_args()
 
     ref_dir = Path(args.ref)
@@ -69,7 +72,8 @@ def main():
         ref = load_file(ref_dir / p["file"])
         out = out_dir / p["file"]
         cmd = [LINGOT, "dump", "--model", args.gguf, "--prompt", p["text"], "--out", out]
-        subprocess.run(cmd + ([] if full else ["--logits-only"]), check=True)
+        n_gen = len(ref["gen_tokens"]) if "gen_tokens" in ref else 0
+        subprocess.run(cmd + (["--gen", str(n_gen)] if full else ["--logits-only"]), check=True)
         ours = load_file(out)
 
         if not np.array_equal(ours["tokens"], ref["tokens"]):
@@ -101,6 +105,25 @@ def main():
             ok = False
             status = f"FIRST DIVERGENCE: {first[0]} at position {first[2]}, error {first[1]:.3e}"
         print(f"{p['name']}: {t} tokens, top-1 {same}/{t}, {status}")
+
+        if n_gen:
+            # Greedy generation: tokens must be identical. A divergence is only tolerated at a
+            # step where the reference's top two logits are closer than --gen-gap.
+            differ = np.nonzero(ours["gen_tokens"] != ref["gen_tokens"])[0]
+            n_same = int(differ[0]) if len(differ) else n_gen
+            if n_same:
+                err, _ = rel_err(ours["gen_logits"][:n_same], ref["gen_logits"][:n_same])
+                worst["gen_logits"] = max(worst.get("gen_logits", 0.0), err)
+                if err > args.rtol:
+                    ok = False
+            status = "identical"
+            if n_same < n_gen:
+                top2 = np.sort(ref["gen_logits"][n_same])[-2:]
+                gap = float(top2[1] - top2[0])
+                allowed = gap < args.gen_gap
+                ok = ok and allowed
+                status = f"DIVERGES at step {n_same}, reference top-1/top-2 gap {gap:.3e} ({'near-tie, tolerated' if allowed else 'NOT a near-tie'})"
+            print(f"  greedy: {n_same}/{n_gen} tokens, {status}")
 
     print("\nworst error per tensor kind:")
     for kind, err in worst.items():
