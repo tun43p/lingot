@@ -137,3 +137,9 @@ fn check_ops<B: Backend>(b: &B) {
 fn cpu() {
     check_ops(&Cpu);
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal() {
+    check_ops(&engine::backend::metal::Metal::new().unwrap());
+}

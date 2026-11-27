@@ -3,7 +3,8 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use engine::backend::Backend;
 use engine::backend::cpu::Cpu;
 use engine::gguf::{Gguf, Qwen3Config};
 use engine::model::Model;
@@ -24,16 +25,62 @@ enum Command {
     Inspect { file: PathBuf },
     /// Chat with a model: one answer with --prompt, interactive without
     Run(RunArgs),
+    /// Measure prefill and decode speed, like llama-bench
+    Bench(BenchArgs),
     /// Perplexity of a text file, computed like llama-perplexity
     Perplexity(PerplexityArgs),
     /// Run a raw prompt and write every activation to a safetensors file (for ref/compare.py)
     Dump(DumpArgs),
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum BackendKind {
+    /// Scalar reference
+    Cpu,
+    /// GPU
+    Metal,
+}
+
+#[cfg(target_os = "macos")]
+fn metal() -> Result<engine::backend::metal::Metal> {
+    engine::backend::metal::Metal::new().map_err(anyhow::Error::msg)
+}
+
+/// Call a function generic over the backend with the backend chosen on the command line.
+macro_rules! with_backend {
+    ($kind:expr, $function:ident, $args:expr) => {
+        match $kind {
+            BackendKind::Cpu => $function($args, Cpu),
+            #[cfg(target_os = "macos")]
+            BackendKind::Metal => $function($args, metal()?),
+            #[cfg(not(target_os = "macos"))]
+            BackendKind::Metal => anyhow::bail!("the Metal backend needs macOS"),
+        }
+    };
+}
+
+#[derive(Args)]
+struct BenchArgs {
+    #[arg(long)]
+    model: PathBuf,
+    #[arg(long, value_enum, default_value = "metal")]
+    backend: BackendKind,
+    /// Prompt length for the prefill test (pp)
+    #[arg(short = 'p', long, default_value_t = 512)]
+    n_prompt: usize,
+    /// Tokens generated for the decode test (tg)
+    #[arg(short = 'n', long, default_value_t = 128)]
+    n_gen: usize,
+    #[arg(short, long, default_value_t = 5)]
+    repetitions: usize,
+}
+
 #[derive(Args)]
 struct RunArgs {
     #[arg(long)]
     model: PathBuf,
+    #[arg(long, value_enum, default_value = "metal")]
+    backend: BackendKind,
     /// User message. Without it, messages are read from stdin, one per line.
     #[arg(long)]
     prompt: Option<String>,
@@ -66,6 +113,8 @@ struct RunArgs {
 struct PerplexityArgs {
     #[arg(long)]
     model: PathBuf,
+    #[arg(long, value_enum, default_value = "metal")]
+    backend: BackendKind,
     /// Text file, e.g. WikiText-2's wiki.test.raw
     #[arg(short, long)]
     file: PathBuf,
@@ -81,6 +130,8 @@ struct PerplexityArgs {
 struct DumpArgs {
     #[arg(long)]
     model: PathBuf,
+    #[arg(long, value_enum, default_value = "cpu")]
+    backend: BackendKind,
     #[arg(long)]
     prompt: String,
     #[arg(long)]
@@ -96,9 +147,10 @@ struct DumpArgs {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Inspect { file } => inspect(&file),
-        Command::Run(args) => run(&args),
-        Command::Perplexity(args) => perplexity(&args),
-        Command::Dump(args) => dump(&args),
+        Command::Run(args) => with_backend!(args.backend, run, &args),
+        Command::Bench(args) => with_backend!(args.backend, bench, &args),
+        Command::Perplexity(args) => with_backend!(args.backend, perplexity, &args),
+        Command::Dump(args) => with_backend!(args.backend, dump, &args),
     }
 }
 
@@ -136,10 +188,10 @@ fn inspect(file: &Path) -> Result<()> {
     Ok(())
 }
 
-fn run(args: &RunArgs) -> Result<()> {
+fn run<B: Backend>(args: &RunArgs, backend: B) -> Result<()> {
     let gguf = Gguf::open(&args.model)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let model = Model::load(&gguf, Cpu)?;
+    let model = Model::load(&gguf, backend)?;
 
     // Sampling defaults recommended by the model file, when it has them.
     let meta = |key: &str| gguf.get(&format!("general.sampling.{key}"));
@@ -206,13 +258,72 @@ fn run(args: &RunArgs) -> Result<()> {
     }
 }
 
+/// Same tests as `llama-bench -p N -n M`: `pp` evaluates a prompt of N tokens in one batch from
+/// an empty context, `tg` generates M tokens one at a time from an empty context. Tokens are
+/// random (fixed seed); one unmeasured warm-up run comes first.
+fn bench<B: Backend>(args: &BenchArgs, backend: B) -> Result<()> {
+    let gguf = Gguf::open(&args.model)?;
+    let model = Model::load(&gguf, backend)?;
+    let (n_prompt, n_gen) = (args.n_prompt, args.n_gen);
+    anyhow::ensure!(n_prompt > 0 && n_gen > 0 && args.repetitions > 0);
+
+    let mut seed = 0x2545_F491_4F6C_DD1Du64; // xorshift
+    let mut random_token = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % model.config.vocab_size as u64) as u32
+    };
+    let prompt: Vec<u32> = (0..n_prompt).map(|_| random_token()).collect();
+    let first = random_token();
+    let mut state = model.new_state(n_prompt.max(n_gen));
+
+    let prefill = |state: &mut _| {
+        state_reset(state);
+        let start = std::time::Instant::now();
+        model.forward(state, &prompt, n_prompt - 1, None);
+        n_prompt as f64 / start.elapsed().as_secs_f64()
+    };
+    let decode = |state: &mut _| {
+        state_reset(state);
+        let mut token = first;
+        let start = std::time::Instant::now();
+        for _ in 0..n_gen {
+            token = argmax(&model.forward(state, &[token], 0, None));
+        }
+        n_gen as f64 / start.elapsed().as_secs_f64()
+    };
+
+    prefill(&mut state);
+    decode(&mut state);
+    let pp: Vec<f64> = (0..args.repetitions).map(|_| prefill(&mut state)).collect();
+    let tg: Vec<f64> = (0..args.repetitions).map(|_| decode(&mut state)).collect();
+
+    let summary = |runs: &[f64]| {
+        let mean = runs.iter().sum::<f64>() / runs.len() as f64;
+        let var =
+            runs.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (runs.len().max(2) - 1) as f64;
+        format!("{mean:.2} ± {:.2}", var.sqrt())
+    };
+    let name = args.model.file_name().unwrap_or_default().to_string_lossy();
+    println!("| model | test | t/s |");
+    println!("| --- | --- | --- |");
+    println!("| {name} | pp{n_prompt} | {} |", summary(&pp));
+    println!("| {name} | tg{n_gen} | {} |", summary(&tg));
+    Ok(())
+}
+
+fn state_reset<B: Backend>(state: &mut engine::model::State<B>) {
+    state.truncate(0);
+}
+
 /// Same method as llama-perplexity: the text is cut into chunks of `ctx` tokens, each chunk is
 /// evaluated from an empty context, and only the second half of each chunk is scored (the
 /// tokens at positions ctx/2 + 1 .. ctx - 1, given everything before them).
-fn perplexity(args: &PerplexityArgs) -> Result<()> {
+fn perplexity<B: Backend>(args: &PerplexityArgs, backend: B) -> Result<()> {
     let gguf = Gguf::open(&args.model)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let model = Model::load(&gguf, Cpu)?;
+    let model = Model::load(&gguf, backend)?;
     let text = std::fs::read_to_string(&args.file)
         .with_context(|| format!("reading {}", args.file.display()))?;
     let tokens = tokenizer.encode(&text);
@@ -264,10 +375,10 @@ fn perplexity(args: &PerplexityArgs) -> Result<()> {
 /// Tensors are named like the Hugging Face dump (ref/dump.py). Activations have one row per
 /// prompt token (`[T, n]`, Q and K rows being `[n_head][head_dim]`), `gen_logits` one row per
 /// generated token. All F32, except `tokens` and `gen_tokens` in I32.
-fn dump(args: &DumpArgs) -> Result<()> {
+fn dump<B: Backend>(args: &DumpArgs, backend: B) -> Result<()> {
     let gguf = Gguf::open(&args.model)?;
     let tokens = Tokenizer::from_gguf(&gguf)?.encode(&args.prompt);
-    let model = Model::load(&gguf, Cpu)?;
+    let model = Model::load(&gguf, backend)?;
 
     let mut traced: BTreeMap<String, Vec<f32>> = BTreeMap::new();
     let mut state = model.new_state(tokens.len() + args.r#gen);

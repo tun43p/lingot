@@ -6,7 +6,8 @@
 //! when decoding and the prompt length when prefilling.
 
 pub mod cpu;
-// metal backend added below
+#[cfg(target_os = "macos")]
+pub mod metal;
 
 use crate::gguf::TensorType;
 

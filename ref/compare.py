@@ -4,6 +4,7 @@ the first layer and tensor that diverge.
 Usage (after `cargo build --release`):
   python ref/compare.py --gguf models/qwen3-0.6B-bf16.gguf --ref ref/dumps/qwen3-0.6B-f32
   python ref/compare.py --gguf models/qwen3-8B-bf16.gguf   --ref ref/dumps/qwen3-8B-bf16
+  python ref/compare.py --gguf models/qwen3-8B-q4_0.gguf   --ref cpu --backend metal
 
 Runs `lingot dump` on each prompt of the reference, then compares every tensor.
 Error of a tensor = max over positions of  max|ours - ref| / max|ref|  on that position.
@@ -12,6 +13,8 @@ Full reference (f32): every tensor must be within --rtol and top-1 must match ev
 The greedy generation must give the same tokens; a divergence is tolerated only at a step
 where the reference's top-1 and top-2 logits are closer than --gen-gap.
 Logits-only reference (bf16): top-1 must match on at least --min-top1 of the positions.
+`--ref cpu`: the reference is lingot's CPU backend on ref/prompts.json; logits must be within
+--rtol and top-1 must match everywhere.
 Top-1 matches when our argmax has the reference's max logit, so an exact tie between
 the reference's top logits is a match whichever of the tied tokens we pick.
 Exit code 1 on failure.
@@ -53,16 +56,30 @@ def rel_err(ours, ref):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True)
-    ap.add_argument("--ref", required=True, help="directory written by ref/dump.py")
+    ap.add_argument("--ref", required=True, help="directory written by ref/dump.py, or `cpu`")
+    ap.add_argument("--backend", default="cpu", choices=["cpu", "metal"])
     ap.add_argument("--rtol", type=float, default=1e-3)
     ap.add_argument("--min-top1", type=float, default=0.99)
     ap.add_argument("--gen-gap", type=float, default=1e-3)
     args = ap.parse_args()
 
-    ref_dir = Path(args.ref)
-    index = json.loads((ref_dir / "index.json").read_text())
-    out_dir = ROOT / "ref/dumps" / f"lingot-{Path(args.gguf).stem}"
+    out_dir = ROOT / "ref/dumps" / f"lingot-{Path(args.gguf).stem}-{args.backend}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    against_cpu = args.ref == "cpu"
+    if against_cpu:
+        # The reference is lingot's own CPU backend: logits of the 5 prompts, within --rtol.
+        ref_dir = ROOT / "ref/dumps" / f"lingot-{Path(args.gguf).stem}-cpu-logits"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        prompts = json.loads((ROOT / "ref/prompts.json").read_text())
+        index = {"dtype": "cpu", "prompts": []}
+        for i, p in enumerate(prompts):
+            file = f"prompt_{i}.safetensors"
+            cmd = [LINGOT, "dump", "--model", args.gguf, "--prompt", p["text"], "--logits-only"]
+            subprocess.run(cmd + ["--backend", "cpu", "--out", ref_dir / file], check=True)
+            index["prompts"].append({"name": p["name"], "text": p["text"], "file": file})
+    else:
+        ref_dir = Path(args.ref)
+        index = json.loads((ref_dir / "index.json").read_text())
     full = index["dtype"] == "f32"
     ok = True
     worst = {}  # tensor kind -> worst error over all prompts
@@ -72,6 +89,7 @@ def main():
         ref = load_file(ref_dir / p["file"])
         out = out_dir / p["file"]
         cmd = [LINGOT, "dump", "--model", args.gguf, "--prompt", p["text"], "--out", out]
+        cmd += ["--backend", args.backend]
         n_gen = len(ref["gen_tokens"]) if "gen_tokens" in ref else 0
         subprocess.run(cmd + (["--gen", str(n_gen)] if full else ["--logits-only"]), check=True)
         ours = load_file(out)
@@ -90,7 +108,7 @@ def main():
             err, pos = rel_err(ours[name], r.reshape(t, -1))
             kind = name.split(".")[0] if name[0] != "l" or name == "logits" else name.split(".")[1]
             worst[kind] = max(worst.get(kind, 0.0), err)
-            if full and err > args.rtol and first is None:
+            if (full or against_cpu) and err > args.rtol and first is None:
                 first = (name, err, pos)
 
         # Our top-1 matches if the reference gives it its max logit: exact ties in the
@@ -129,9 +147,9 @@ def main():
     for kind, err in worst.items():
         print(f"  {kind:<9} {err:.3e}")
     ratio = top1_same / max(top1_total, 1)
-    need = 1.0 if full else args.min_top1
+    need = 1.0 if full or against_cpu else args.min_top1
     print(f"\ntop-1 agreement: {top1_same}/{top1_total} = {ratio:.4f} (required {need})")
-    if full:
+    if full or against_cpu:
         print(f"tolerance: {args.rtol:g}")
     if ratio < need:
         ok = False
