@@ -36,36 +36,55 @@ fn assert_close(name: &str, got: &[f32], want: &Value) {
     }
 }
 
+/// Weight bytes copied into 8-byte aligned storage, like tensors in a GGUF file (which start
+/// on 32-byte boundaries).
+fn aligned(v: &Value) -> Vec<u64> {
+    let bytes = v.as_array().unwrap();
+    let mut storage = vec![0u64; bytes.len() / 8 + 1];
+    for (i, byte) in bytes.iter().enumerate() {
+        storage[i / 8] |= byte.as_u64().unwrap() << (i % 8 * 8); // little-endian
+    }
+    storage
+}
+
+fn bytes_of<'a>(storage: &'a [u64], v: &Value) -> &'a [u8] {
+    let len = v.as_array().unwrap().len();
+    // SAFETY: `storage` holds at least `len` initialized bytes.
+    unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), len) }
+}
+
 fn check_ops<B: Backend>(b: &B) {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ops.json");
     let fx: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let up = |v: &Value| b.upload(&floats(v));
 
     for (kind, ty) in WEIGHT_TYPES {
-        let f = &fx[format!("matmul_{kind}")];
-        let bytes: Vec<u8> = (f["weight_bytes"].as_array().unwrap().iter())
-            .map(|x| x.as_u64().unwrap() as u8)
-            .collect();
-        // GGUF tensors start on 32-byte boundaries: keep that property for the test data.
-        let mut aligned = vec![0u64; bytes.len() / 8 + 1];
-        let data = unsafe {
-            std::slice::from_raw_parts_mut(aligned.as_mut_ptr().cast::<u8>(), bytes.len())
-        };
-        data.copy_from_slice(&bytes);
+        // matmul: a batch of 3 tokens; matvec: one token, rows not a multiple of 4;
+        // matmul_tiled: 35 tokens and 70 rows, enough for several partly filled tiles.
+        for op in ["matmul", "matvec", "matmul_tiled"] {
+            let f = &fx[format!("{op}_{kind}")];
+            let storage = aligned(&f["weight_bytes"]);
+            let (rows, cols) = (int(&f["rows"]), int(&f["cols"]));
+            let w = b.weights(Weight {
+                ty,
+                rows,
+                cols,
+                data: bytes_of(&storage, &f["weight_bytes"]),
+            });
+            let mut out = b.alloc(floats(&f["x"]).len() / cols * rows);
+            b.matmul(&w, &up(&f["x"]), &mut out);
+            assert_close(&format!("{op}_{kind}"), &b.read(&out), &f["out"]);
+        }
+
+        let f = &fx[format!("embed_{kind}")];
+        let storage = aligned(&f["weight_bytes"]);
         let (rows, cols) = (int(&f["rows"]), int(&f["cols"]));
         let w = b.weights(Weight {
             ty,
             rows,
             cols,
-            data,
+            data: bytes_of(&storage, &f["weight_bytes"]),
         });
-
-        let x = up(&f["x"]);
-        let mut out = b.alloc(floats(&f["x"]).len() / cols * rows);
-        b.matmul(&w, &x, &mut out);
-        assert_close(&format!("matmul_{kind}"), &b.read(&out), &f["out"]);
-
-        let f = &fx[format!("embed_{kind}")];
         let tokens: Vec<u32> = (f["tokens"].as_array().unwrap().iter())
             .map(|t| t.as_u64().unwrap() as u32)
             .collect();
@@ -75,11 +94,13 @@ fn check_ops<B: Backend>(b: &B) {
         assert_eq!(b.read(&out), floats(&f["out"]), "embed_{kind}");
     }
 
-    let f = &fx["rms_norm"];
-    let mut out = b.alloc(floats(&f["x"]).len());
-    let eps = f["eps"].as_f64().unwrap() as f32;
-    b.rms_norm(&up(&f["x"]), &up(&f["weight"]), eps, &mut out);
-    assert_close("rms_norm", &b.read(&out), &f["out"]);
+    for name in ["rms_norm", "rms_norm_wide"] {
+        let f = &fx[name];
+        let mut out = b.alloc(floats(&f["x"]).len());
+        let eps = f["eps"].as_f64().unwrap() as f32;
+        b.rms_norm(&up(&f["x"]), &up(&f["weight"]), eps, &mut out);
+        assert_close(name, &b.read(&out), &f["out"]);
+    }
 
     let f = &fx["rope"];
     let mut x = up(&f["x"]);

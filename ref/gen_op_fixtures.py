@@ -55,6 +55,20 @@ for kind in ("f32", "bf16", "q8_0", "q4_0"):
         "rows": 5, "cols": 64, "weight_bytes": list(raw), "x": flat(x),
         "out": flat(x.astype(np.float64) @ w.T),
     }
+    # single token, and a row count that is not a multiple of 4
+    raw1, w1 = weights(kind, 7, 128)
+    x1 = rand(128)
+    fx[f"matvec_{kind}"] = {
+        "rows": 7, "cols": 128, "weight_bytes": list(raw1), "x": flat(x1),
+        "out": flat(w1 @ x1.astype(np.float64)),
+    }
+    # a batch large enough for tiles, with rows and tokens that do not fill the last tiles
+    raw2, w2 = weights(kind, 70, 64)
+    x2 = rand(35, 64)
+    fx[f"matmul_tiled_{kind}"] = {
+        "rows": 70, "cols": 64, "weight_bytes": list(raw2), "x": flat(x2),
+        "out": flat(x2.astype(np.float64) @ w2.T),
+    }
     fx[f"embed_{kind}"] = {
         "rows": 5, "cols": 64, "weight_bytes": list(raw), "tokens": tokens, "out": flat(w[tokens]),
     }
@@ -63,6 +77,14 @@ for kind in ("f32", "bf16", "q8_0", "q4_0"):
 x, weight, eps = rand(3, 16, scale=3.0), rand(16), 1e-6
 x64 = x.astype(np.float64)
 fx["rms_norm"] = {
+    "x": flat(x), "weight": flat(weight), "eps": eps,
+    "out": flat(x64 / np.sqrt(np.mean(x64**2, axis=1, keepdims=True) + eps) * weight),
+}
+
+# rms_norm on chunks wide enough for several simdgroups: 2 chunks of 256
+x, weight = rand(2, 256, scale=3.0), rand(256)
+x64 = x.astype(np.float64)
+fx["rms_norm_wide"] = {
     "x": flat(x), "weight": flat(weight), "eps": eps,
     "out": flat(x64 / np.sqrt(np.mean(x64**2, axis=1, keepdims=True) + eps) * weight),
 }
