@@ -44,6 +44,35 @@ fx["embed_bf16"] = {
     "rows": 5, "cols": 7, "weight_bytes": list(bits.tobytes()), "token": 3, "out": flat(wb[3]),
 }
 
+# matvec / embed on quantized weights: 3 rows of 2 blocks of 32 weights
+def blocks(n, kind):
+    """n random blocks: (raw bytes, dequantized weights)."""
+    raw, values = b"", []
+    for _ in range(n):
+        d = np.float16(rng.uniform(0.001, 0.05) * rng.choice([-1, 1]))
+        if kind == "q8_0":  # d, then 32 int8: w = q * d
+            q = rng.integers(-128, 128, 32, dtype=np.int8)
+            raw += d.tobytes() + q.tobytes()
+            values.append(q.astype(np.float64) * float(d))
+        else:  # q4_0: d, then 16 bytes; low nibble = weight j, high nibble = weight j + 16
+            q = rng.integers(0, 256, 16, dtype=np.uint8)
+            raw += d.tobytes() + q.tobytes()
+            both = np.concatenate([q & 0x0F, q >> 4]).astype(np.float64)
+            values.append((both - 8) * float(d))
+    return raw, np.concatenate(values)
+
+
+x = rand(64)
+for kind in ("q8_0", "q4_0"):
+    raw, w = blocks(6, kind)
+    w = w.reshape(3, 64)
+    fx[f"matvec_{kind}"] = {
+        "rows": 3, "cols": 64, "weight_bytes": list(raw), "x": flat(x), "out": flat(w @ x),
+    }
+    fx[f"embed_{kind}"] = {
+        "rows": 3, "cols": 64, "weight_bytes": list(raw), "token": 1, "out": flat(w[1]),
+    }
+
 # rms_norm
 x, weight, eps = rand(16, scale=3.0), rand(16), 1e-6
 x64 = x.astype(np.float64)

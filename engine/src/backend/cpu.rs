@@ -17,38 +17,135 @@ fn f32le(b: &[u8]) -> f32 {
     f32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
-/// (bytes per value, decoder) for the weight types this backend can read.
-fn decoder(ty: TensorType) -> (usize, fn(&[u8]) -> f32) {
+fn f16(b: &[u8]) -> f32 {
+    half::f16::from_le_bytes([b[0], b[1]]).to_f32()
+}
+
+// Quantized blocks hold 32 weights: a scale `d` in f16, then the quantized values.
+const BLOCK: usize = 32;
+/// Q8_0: `d`, then 32 int8. Weight = q * d.
+const Q8_0_BYTES: usize = 2 + 32;
+/// Q4_0: `d`, then 16 bytes of nibbles. The low nibble of byte `j` is weight `j`, the high
+/// nibble is weight `j + 16`. Weight = (q - 8) * d.
+const Q4_0_BYTES: usize = 2 + 16;
+
+fn nibbles(byte: u8) -> (f32, f32) {
+    ((byte & 0x0F) as f32 - 8.0, (byte >> 4) as f32 - 8.0)
+}
+
+/// Bytes taken by one row of `cols` weights.
+fn row_bytes(ty: TensorType, cols: usize) -> usize {
     match ty {
-        TensorType::BF16 => (2, bf16),
-        TensorType::F32 => (4, f32le),
-        other => panic!("CPU backend does not support {other} weights yet"),
+        TensorType::F32 => cols * 4,
+        TensorType::BF16 => cols * 2,
+        TensorType::Q8_0 | TensorType::Q4_0 => {
+            assert!(
+                cols.is_multiple_of(BLOCK),
+                "quantized rows must be whole blocks"
+            );
+            cols / BLOCK
+                * if ty == TensorType::Q8_0 {
+                    Q8_0_BYTES
+                } else {
+                    Q4_0_BYTES
+                }
+        }
+        TensorType::F16 => panic!("CPU backend does not support F16 weights"),
     }
+}
+
+/// Decode one row of weights to f32.
+fn decode_row(ty: TensorType, row: &[u8], out: &mut [f32]) {
+    match ty {
+        TensorType::F32 => {
+            for (o, b) in out.iter_mut().zip(row.chunks_exact(4)) {
+                *o = f32le(b);
+            }
+        }
+        TensorType::BF16 => {
+            for (o, b) in out.iter_mut().zip(row.chunks_exact(2)) {
+                *o = bf16(b);
+            }
+        }
+        TensorType::Q8_0 => {
+            for (out, block) in out
+                .chunks_exact_mut(BLOCK)
+                .zip(row.chunks_exact(Q8_0_BYTES))
+            {
+                let d = f16(block);
+                for (o, q) in out.iter_mut().zip(&block[2..]) {
+                    *o = (*q as i8) as f32 * d;
+                }
+            }
+        }
+        TensorType::Q4_0 => {
+            for (out, block) in out
+                .chunks_exact_mut(BLOCK)
+                .zip(row.chunks_exact(Q4_0_BYTES))
+            {
+                let d = f16(block);
+                for (j, byte) in block[2..].iter().enumerate() {
+                    let (lo, hi) = nibbles(*byte);
+                    out[j] = lo * d;
+                    out[j + BLOCK / 2] = hi * d;
+                }
+            }
+        }
+        TensorType::F16 => panic!("CPU backend does not support F16 weights"),
+    }
+}
+
+/// Dot product of one row of weights with `x`, dequantizing on the fly.
+fn dot(ty: TensorType, row: &[u8], x: &[f32]) -> f32 {
+    let mut sum = 0.0f32;
+    match ty {
+        TensorType::F32 => {
+            for (b, x) in row.chunks_exact(4).zip(x) {
+                sum += f32le(b) * x;
+            }
+        }
+        TensorType::BF16 => {
+            for (b, x) in row.chunks_exact(2).zip(x) {
+                sum += bf16(b) * x;
+            }
+        }
+        TensorType::Q8_0 => {
+            for (block, x) in row.chunks_exact(Q8_0_BYTES).zip(x.chunks_exact(BLOCK)) {
+                let d = f16(block);
+                for (q, x) in block[2..].iter().zip(x) {
+                    sum += (*q as i8) as f32 * d * x;
+                }
+            }
+        }
+        TensorType::Q4_0 => {
+            for (block, x) in row.chunks_exact(Q4_0_BYTES).zip(x.chunks_exact(BLOCK)) {
+                let d = f16(block);
+                let (x_lo, x_hi) = x.split_at(BLOCK / 2);
+                for (j, byte) in block[2..].iter().enumerate() {
+                    let (lo, hi) = nibbles(*byte);
+                    sum += lo * d * x_lo[j];
+                    sum += hi * d * x_hi[j];
+                }
+            }
+        }
+        TensorType::F16 => panic!("CPU backend does not support F16 weights"),
+    }
+    sum
 }
 
 impl Backend for Cpu {
     fn embed(&self, w: &Weight, token: u32, out: &mut [f32]) {
-        let (size, decode) = decoder(w.ty);
+        let size = row_bytes(w.ty, w.cols);
         let row = token as usize;
         assert!(row < w.rows && out.len() == w.cols);
-        let bytes = &w.data[row * w.cols * size..(row + 1) * w.cols * size];
-        for (o, b) in out.iter_mut().zip(bytes.chunks_exact(size)) {
-            *o = decode(b);
-        }
+        decode_row(w.ty, &w.data[row * size..(row + 1) * size], out);
     }
 
     fn matvec(&self, w: &Weight, x: &[f32], out: &mut [f32]) {
-        let (size, decode) = decoder(w.ty);
         assert!(x.len() == w.cols && out.len() == w.rows);
         out.par_iter_mut()
-            .zip(w.data.par_chunks_exact(w.cols * size))
-            .for_each(|(o, row)| {
-                let mut sum = 0.0f32;
-                for (b, x) in row.chunks_exact(size).zip(x) {
-                    sum += decode(b) * x;
-                }
-                *o = sum;
-            });
+            .zip(w.data.par_chunks_exact(row_bytes(w.ty, w.cols)))
+            .for_each(|(o, row)| *o = dot(w.ty, row, x));
     }
 
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {

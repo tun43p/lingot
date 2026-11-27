@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+half = "2"
 memmap2 = "0.9"
 rayon = "1"
 thiserror = "2"

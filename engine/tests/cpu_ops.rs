@@ -55,13 +55,17 @@ fn weight<'a>(f: &Value, ty: TensorType, data: &'a [u8]) -> Weight<'a> {
     }
 }
 
+const WEIGHT_TYPES: [(&str, TensorType); 4] = [
+    ("f32", TensorType::F32),
+    ("bf16", TensorType::BF16),
+    ("q8_0", TensorType::Q8_0),
+    ("q4_0", TensorType::Q4_0),
+];
+
 #[test]
 fn matvec() {
-    for (name, ty) in [
-        ("matvec_f32", TensorType::F32),
-        ("matvec_bf16", TensorType::BF16),
-    ] {
-        let f = fixture(name);
+    for (name, ty) in WEIGHT_TYPES {
+        let f = fixture(&format!("matvec_{name}"));
         let data = bytes(&f["weight_bytes"]);
         let w = weight(&f, ty, &data);
         let mut out = vec![0.0; w.rows];
@@ -72,13 +76,15 @@ fn matvec() {
 
 #[test]
 fn embed() {
-    let f = fixture("embed_bf16");
-    let data = bytes(&f["weight_bytes"]);
-    let w = weight(&f, TensorType::BF16, &data);
-    let mut out = vec![0.0; w.cols];
-    Cpu.embed(&w, int(&f["token"]) as u32, &mut out);
-    // BF16 -> f32 is a bit shift: exact.
-    assert_eq!(out, floats(&f["out"]));
+    for (name, ty) in &WEIGHT_TYPES[1..] {
+        let f = fixture(&format!("embed_{name}"));
+        let data = bytes(&f["weight_bytes"]);
+        let w = weight(&f, *ty, &data);
+        let mut out = vec![0.0; w.cols];
+        Cpu.embed(&w, int(&f["token"]) as u32, &mut out);
+        // Decoding is exact: a bit shift for BF16, a small integer times an f16 otherwise.
+        assert_eq!(out, floats(&f["out"]), "{name}");
+    }
 }
 
 #[test]

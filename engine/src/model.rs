@@ -82,9 +82,11 @@ impl<'a, B: Backend> Model<'a, B> {
         // GGUF dims are innermost first: [cols, rows].
         let weight = |name: &str, rows: usize, cols: usize| -> Result<Weight<'a>> {
             let t = tensor(name, &[cols, rows])?;
-            if !matches!(t.ty, TensorType::BF16 | TensorType::F32) {
+            let quantized = matches!(t.ty, TensorType::Q8_0 | TensorType::Q4_0);
+            // Quantized rows are made of whole 32-weight blocks.
+            if t.ty == TensorType::F16 || (quantized && !cols.is_multiple_of(32)) {
                 return Err(Error::Invalid(format!(
-                    "tensor `{name}` is {}, only BF16 and F32 weights are supported for now",
+                    "tensor `{name}` ({}, {cols} columns) is not supported",
                     t.ty
                 )));
             }
