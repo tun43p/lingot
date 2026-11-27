@@ -9,7 +9,8 @@ No timestamps anywhere, so two runs can be compared byte for byte.
 
 Tensor names (NN = zero-padded layer index, T = prompt length):
   tokens               [T]        prompt token ids
-  hidden.NN            [T, d]     hidden.00 = embeddings, hidden.NN = output of layer NN-1
+  hidden.NN            [T, d]     hidden.00 = embeddings, hidden.NN = output of layer NN-1;
+                                  the last one is taken after the final norm
   lNN.attn_out         [T, d]     attention output after o_proj, before the residual add
   lNN.mlp_out          [T, d]     MLP output, before the residual add
   lNN.q_norm/.k_norm   [H, T, hd] Q/K after QK-Norm, before RoPE
