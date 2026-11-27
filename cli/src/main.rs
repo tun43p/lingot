@@ -223,6 +223,7 @@ fn run<B: Backend>(args: &RunArgs, backend: B) -> Result<()> {
             print!("{text}");
             let _ = stdout.flush();
             reply.push_str(&text);
+            true
         })?;
         let rest = stream.finish();
         println!("{rest}");

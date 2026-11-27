@@ -52,6 +52,8 @@ pub enum StopReason {
     Stop,
     MaxTokens,
     ContextFull,
+    /// The caller's `on_token` asked to stop.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,13 +90,13 @@ impl<'m, 'g, B: Backend> Session<'m, 'g, B> {
 
     /// Evaluate `prompt` (reusing the cache for the prefix it shares with the previous call),
     /// then generate until a stop token, `max_tokens` or a full context. `on_token` receives
-    /// each generated token; the stop token is not passed on.
+    /// each generated token (the stop token is not passed on) and returns whether to go on.
     pub fn generate(
         &mut self,
         prompt: &[u32],
         sampler: &mut Sampler,
         max_tokens: usize,
-        on_token: &mut dyn FnMut(u32),
+        on_token: &mut dyn FnMut(u32) -> bool,
     ) -> Result<Stats> {
         if prompt.is_empty() {
             return Err(Error::Invalid("empty prompt".into()));
@@ -135,8 +137,10 @@ impl<'m, 'g, B: Backend> Session<'m, 'g, B> {
             if self.stop_tokens.contains(&token) {
                 break StopReason::Stop;
             }
-            on_token(token);
             generated_tokens += 1;
+            if !on_token(token) {
+                break StopReason::Cancelled;
+            }
             if self.state.pos() == self.state.n_ctx() {
                 break StopReason::ContextFull;
             }

@@ -75,7 +75,10 @@ fn two_turns_reuse_the_cache() {
         let prompt = tok.encode(&render_chat(messages, false));
         let mut out = Vec::new();
         let stats = session
-            .generate(&prompt, &mut Sampler::new(greedy), 24, &mut |t| out.push(t))
+            .generate(&prompt, &mut Sampler::new(greedy), 24, &mut |t| {
+                out.push(t);
+                true
+            })
             .unwrap();
         (out, stats)
     };
@@ -102,6 +105,17 @@ fn two_turns_reuse_the_cache() {
     let (expected, fresh_stats) = run(&mut fresh, &messages);
     assert_eq!(fresh_stats.prefill_tokens, fresh_stats.prompt_tokens);
     assert_eq!(second, expected);
+
+    // The callback can stop the generation.
+    let prompt = tok.encode(&render_chat(&messages[..1], false));
+    let mut count = 0;
+    let stats = fresh
+        .generate(&prompt, &mut Sampler::new(greedy), 24, &mut |_| {
+            count += 1;
+            false
+        })
+        .unwrap();
+    assert_eq!((count, stats.stop), (1, StopReason::Cancelled));
 
     // A context too small for the generation stops cleanly.
     let prompt = tok.encode(&render_chat(&messages[..1], false));
