@@ -1,0 +1,22 @@
+[
+  {
+    "name": "french",
+    "text": "Le petit café au coin de la rue était fermé depuis l'été dernier, et personne ne savait vraiment pourquoi le propriétaire"
+  },
+  {
+    "name": "english",
+    "text": "The history of the steam engine begins long before the industrial revolution, when early inventors first noticed that"
+  },
+  {
+    "name": "code",
+    "text": "def fibonacci(n: int) -> int:\n    \"\"\"Return the n-th Fibonacci number.\"\"\"\n    if n < 2:\n        return n\n    a, b = 0, 1\n    for _ in range(n - 1):\n"
+  },
+  {
+    "name": "numbers",
+    "text": "On 2024-03-15 at 14:30, the invoice #00123 totalled 1,234.56 EUR (3.14159 x 392.97), up 12.5% from 1 097.39 in 2023:"
+  },
+  {
+    "name": "emojis",
+    "text": "Weekend plans 🎉: hiking 🥾⛰️ on Saturday, then pizza 🍕 with friends 👨‍👩‍👧‍👦, and maybe a movie 🎬🍿 if it rains ☔️. Honestly"
+  }
+]
