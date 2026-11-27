@@ -414,6 +414,7 @@ dependencies = [
  "axum",
  "clap",
  "engine",
+ "futures-core",
  "serde",
  "serde_json",
  "tokio",

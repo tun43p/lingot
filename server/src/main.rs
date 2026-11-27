@@ -3,14 +3,19 @@
 //! The model lives on one worker thread, which takes requests from a queue and runs them one
 //! at a time. HTTP handlers only parse, enqueue and relay what the worker sends back.
 
+use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as queue};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -318,7 +323,17 @@ async fn chat_completions(
     let id = format!("chatcmpl-{number}");
 
     if request.stream {
-        return bad_request("streaming is not available in this build");
+        let mut chunks = Chunks {
+            received,
+            id,
+            model: app.model.clone(),
+            created: now(),
+            queued: VecDeque::new(),
+            finished: false,
+        };
+        let first = chunks.chunk(json!({"role": "assistant", "content": ""}), Value::Null);
+        chunks.queued.push_back(first);
+        return Sse::new(chunks).into_response();
     }
 
     // If the client disconnects, this future is dropped, `received` with it, and the worker
@@ -354,6 +369,91 @@ async fn chat_completions(
         }
     }
     server_error("the model worker has stopped")
+}
+
+/// The worker's events as server-sent `chat.completion.chunk` events, ending with `[DONE]`.
+/// Dropped when the client disconnects, which closes the channel and stops the worker.
+struct Chunks {
+    received: mpsc::Receiver<Event>,
+    id: String,
+    model: String,
+    created: u64,
+    /// Events ready to be sent.
+    queued: VecDeque<SseEvent>,
+    finished: bool,
+}
+
+impl Chunks {
+    fn chunk(&self, delta: Value, finish_reason: Value) -> SseEvent {
+        self.event(json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }))
+    }
+
+    fn event(&self, value: Value) -> SseEvent {
+        SseEvent::default().data(value.to_string())
+    }
+
+    fn finish(&mut self, last: SseEvent) {
+        self.queued.push_back(last);
+        self.queued.push_back(SseEvent::default().data("[DONE]"));
+        self.finished = true;
+    }
+}
+
+impl futures_core::Stream for Chunks {
+    type Item = Result<SseEvent, Infallible>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(event) = this.queued.pop_front() {
+                return Poll::Ready(Some(Ok(event)));
+            }
+            if this.finished {
+                return Poll::Ready(None);
+            }
+            match this.received.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Event::Text(text))) => {
+                    let chunk = this.chunk(json!({"content": text}), Value::Null);
+                    this.queued.push_back(chunk);
+                }
+                Poll::Ready(Some(Event::Error(message))) => {
+                    let error =
+                        json!({"error": {"message": message, "type": "invalid_request_error"}});
+                    let event = this.event(error);
+                    this.finish(event);
+                }
+                Poll::Ready(Some(Event::Done {
+                    prompt_tokens,
+                    completion_tokens,
+                    finish_reason,
+                })) => {
+                    // The last chunk carries the finish reason and the usage.
+                    let mut last = json!({
+                        "id": this.id,
+                        "object": "chat.completion.chunk",
+                        "created": this.created,
+                        "model": this.model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens,
+                        },
+                    });
+                    let event = this.event(last.take());
+                    this.finish(event);
+                }
+            }
+        }
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
