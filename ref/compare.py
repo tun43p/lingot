@@ -10,6 +10,8 @@ Error of a tensor = max over positions of  max|ours - ref| / max|ref|  on that p
 
 Full reference (f32): every tensor must be within --rtol and top-1 must match everywhere.
 Logits-only reference (bf16): top-1 must match on at least --min-top1 of the positions.
+Top-1 matches when our argmax has the reference's max logit, so an exact tie between
+the reference's top logits is a match whichever of the tied tokens we pick.
 Exit code 1 on failure.
 """
 
@@ -87,7 +89,11 @@ def main():
             if full and err > args.rtol and first is None:
                 first = (name, err, pos)
 
-        same = int((ours["logits"].argmax(axis=1) == ref["logits"].argmax(axis=1)).sum())
+        # Our top-1 matches if the reference gives it its max logit: exact ties in the
+        # reference (common in bf16, which keeps ~3 significant digits) count as matches.
+        rows = np.arange(t)
+        ref_at_ours = ref["logits"][rows, ours["logits"].argmax(axis=1)]
+        same = int((ref_at_ours == ref["logits"].max(axis=1)).sum())
         top1_same += same
         top1_total += t
         status = "ok"
