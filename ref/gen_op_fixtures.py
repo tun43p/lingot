@@ -1,4 +1,5 @@
-"""Generate engine/tests/fixtures/ops.json: NumPy reference values for each Backend op.
+"""Generate engine/tests/fixtures/ops.json: NumPy reference values for each Backend op,
+on small batches of tokens.
 
 Usage: python ref/gen_op_fixtures.py
 Inputs are float32, expected outputs are computed in float64.
@@ -17,95 +18,90 @@ def rand(*shape, scale=1.0):
     return (rng.standard_normal(shape) * scale).astype(np.float32)
 
 
-def as_bf16(w):
-    """Truncate f32 to bf16: (u16 bit patterns, the values they represent)."""
-    bits = (w.view(np.uint32) >> 16).astype(np.uint16)
-    return bits, (bits.astype(np.uint32) << 16).view(np.float32)
-
-
 def flat(a):
     return np.asarray(a, dtype=np.float64).ravel().tolist()
 
 
-fx = {}
-
-# matvec / embed, F32 and BF16 weights (5 rows x 7 cols)
-w, x = rand(5, 7), rand(7)
-bits, wb = as_bf16(rand(5, 7))
-fx["matvec_f32"] = {
-    "rows": 5, "cols": 7, "weight_bytes": list(w.tobytes()), "x": flat(x),
-    "out": flat(w.astype(np.float64) @ x),
-}
-fx["matvec_bf16"] = {
-    "rows": 5, "cols": 7, "weight_bytes": list(bits.tobytes()), "x": flat(x),
-    "out": flat(wb.astype(np.float64) @ x),
-}
-fx["embed_bf16"] = {
-    "rows": 5, "cols": 7, "weight_bytes": list(bits.tobytes()), "token": 3, "out": flat(wb[3]),
-}
-
-# matvec / embed on quantized weights: 3 rows of 2 blocks of 32 weights
-def blocks(n, kind):
-    """n random blocks: (raw bytes, dequantized weights)."""
+def weights(kind, rows, cols):
+    """Random weight matrix of the given GGUF type: (raw bytes, values as float64)."""
+    if kind == "f32":
+        w = rand(rows, cols)
+        return w.tobytes(), w.astype(np.float64)
+    if kind == "bf16":  # top 16 bits of an f32
+        bits = (rand(rows, cols).view(np.uint32) >> 16).astype(np.uint16)
+        return bits.tobytes(), (bits.astype(np.uint32) << 16).view(np.float32).astype(np.float64)
     raw, values = b"", []
-    for _ in range(n):
+    for _ in range(rows * cols // 32):
         d = np.float16(rng.uniform(0.001, 0.05) * rng.choice([-1, 1]))
         if kind == "q8_0":  # d, then 32 int8: w = q * d
             q = rng.integers(-128, 128, 32, dtype=np.int8)
-            raw += d.tobytes() + q.tobytes()
             values.append(q.astype(np.float64) * float(d))
         else:  # q4_0: d, then 16 bytes; low nibble = weight j, high nibble = weight j + 16
             q = rng.integers(0, 256, 16, dtype=np.uint8)
-            raw += d.tobytes() + q.tobytes()
             both = np.concatenate([q & 0x0F, q >> 4]).astype(np.float64)
             values.append((both - 8) * float(d))
-    return raw, np.concatenate(values)
+        raw += d.tobytes() + q.tobytes()
+    return raw, np.concatenate(values).reshape(rows, cols)
 
 
-x = rand(64)
-for kind in ("q8_0", "q4_0"):
-    raw, w = blocks(6, kind)
-    w = w.reshape(3, 64)
-    fx[f"matvec_{kind}"] = {
-        "rows": 3, "cols": 64, "weight_bytes": list(raw), "x": flat(x), "out": flat(w @ x),
+fx = {}
+
+# matmul / embed for every weight type: 5 rows x 64 cols, batch of 3 tokens
+x = rand(3, 64)
+tokens = [4, 0, 4]
+for kind in ("f32", "bf16", "q8_0", "q4_0"):
+    raw, w = weights(kind, 5, 64)
+    fx[f"matmul_{kind}"] = {
+        "rows": 5, "cols": 64, "weight_bytes": list(raw), "x": flat(x),
+        "out": flat(x.astype(np.float64) @ w.T),
     }
     fx[f"embed_{kind}"] = {
-        "rows": 3, "cols": 64, "weight_bytes": list(raw), "token": 1, "out": flat(w[1]),
+        "rows": 5, "cols": 64, "weight_bytes": list(raw), "tokens": tokens, "out": flat(w[tokens]),
     }
 
-# rms_norm
-x, weight, eps = rand(16, scale=3.0), rand(16), 1e-6
+# rms_norm: 3 chunks of 16 sharing one weight vector
+x, weight, eps = rand(3, 16, scale=3.0), rand(16), 1e-6
 x64 = x.astype(np.float64)
 fx["rms_norm"] = {
     "x": flat(x), "weight": flat(weight), "eps": eps,
-    "out": flat(x64 / np.sqrt(np.mean(x64**2) + eps) * weight),
+    "out": flat(x64 / np.sqrt(np.mean(x64**2, axis=1, keepdims=True) + eps) * weight),
 }
 
-# rope, NEOX layout: 3 heads of dim 8 at position 5
-head_dim, pos, base = 8, 5, 1_000_000.0
-x = rand(3, head_dim).astype(np.float64)
-theta = pos / base ** (np.arange(0, head_dim, 2) / head_dim)
-a, b = x[:, : head_dim // 2], x[:, head_dim // 2 :]
+# rope, NEOX layout: 2 tokens at positions 5 and 6, 3 heads of dim 8
+n, n_head, head_dim, pos, base = 2, 3, 8, 5, 1_000_000.0
+x = rand(n, n_head, head_dim).astype(np.float64)
+theta = (pos + np.arange(n))[:, None, None] / base ** (np.arange(0, head_dim, 2) / head_dim)
+a, b = x[..., : head_dim // 2], x[..., head_dim // 2 :]
 fx["rope"] = {
-    "x": flat(x), "head_dim": head_dim, "pos": pos, "freq_base": base,
-    "out": flat(np.concatenate([a * np.cos(theta) - b * np.sin(theta), b * np.cos(theta) + a * np.sin(theta)], axis=1)),
+    "x": flat(x), "n": n, "head_dim": head_dim, "pos": pos, "freq_base": base,
+    "out": flat(np.concatenate([a * np.cos(theta) - b * np.sin(theta), b * np.cos(theta) + a * np.sin(theta)], axis=-1)),
 }
 
-# attention: 4 query heads sharing 2 K/V heads, 3 cached positions.
-# Scores are scaled up so a softmax without max-subtraction would overflow.
-n_head, n_kv, head_dim, n_pos = 4, 2, 8, 3
-q = rand(n_head, head_dim, scale=40.0).astype(np.float64)
-k = rand(n_pos, n_kv, head_dim, scale=40.0).astype(np.float64)
-v = rand(n_pos, n_kv, head_dim).astype(np.float64)
-out = np.zeros((n_head, head_dim))
-for h in range(n_head):
-    kv = h // (n_head // n_kv)
-    s = k[:, kv] @ q[h] / np.sqrt(head_dim)
-    p = np.exp(s - s.max())
-    out[h] = (p / p.sum()) @ v[:, kv]
+# attention: 4 query heads sharing 2 K/V heads. The cache (room for 6 positions) already
+# holds 2 positions; a batch of 3 tokens is added at positions 2..4. Token t sees 0..=2+t.
+# Scores are scaled up so a softmax without max-subtraction would overflow, and the unused
+# cache slot is filled with huge values that must never be read.
+n_head, n_kv, head_dim, pos, n, n_ctx = 4, 2, 8, 2, 3, 6
+q = rand(n, n_head, head_dim, scale=40.0).astype(np.float64)
+k_cache = rand(n_ctx, n_kv, head_dim, scale=40.0)
+v_cache = rand(n_ctx, n_kv, head_dim)
+k_cache[pos:], v_cache[pos:] = 1e30, 1e30
+k, v = rand(n, n_kv, head_dim, scale=40.0), rand(n, n_kv, head_dim)
+k_after, v_after = k_cache.copy(), v_cache.copy()
+k_after[pos : pos + n], v_after[pos : pos + n] = k, v
+out = np.zeros((n, n_head, head_dim))
+for t in range(n):
+    seen = pos + t + 1
+    for h in range(n_head):
+        kv = h // (n_head // n_kv)
+        s = k_after[:seen, kv].astype(np.float64) @ q[t, h] / np.sqrt(head_dim)
+        p = np.exp(s - s.max())
+        out[t, h] = (p / p.sum()) @ v_after[:seen, kv].astype(np.float64)
 fx["attention"] = {
+    "pos": pos, "n_head": n_head, "n_head_kv": n_kv, "head_dim": head_dim,
     "q": flat(q), "k": flat(k), "v": flat(v),
-    "n_head": n_head, "n_head_kv": n_kv, "head_dim": head_dim, "out": flat(out),
+    "k_cache": flat(k_cache), "v_cache": flat(v_cache),
+    "k_cache_after": flat(k_after), "v_cache_after": flat(v_after), "out": flat(out),
 }
 
 # silu_mul, add

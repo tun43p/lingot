@@ -33,7 +33,7 @@ fn top1_matches_hugging_face() {
 
     let mut state = model.new_state(64);
     for (pos, (token, want)) in ints("tokens").iter().zip(ints("top1")).enumerate() {
-        let logits = model.forward(&mut state, *token, &mut |_, _| {});
+        let logits = model.forward(&mut state, &[*token], 0, None);
         let got = logits
             .iter()
             .enumerate()

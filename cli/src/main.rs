@@ -233,11 +233,9 @@ fn perplexity(args: &PerplexityArgs) -> Result<()> {
     for (i, chunk) in tokens.chunks_exact(n_ctx).take(n_chunks).enumerate() {
         state.truncate(0);
         // The last token of a chunk is only a target: no need to evaluate it.
-        for j in 0..n_ctx - 1 {
-            let logits = model.forward(&mut state, chunk[j], &mut |_, _| {});
-            if j < first {
-                continue;
-            }
+        let vocab = model.config.vocab_size;
+        let all = model.forward(&mut state, &chunk[..n_ctx - 1], first, None);
+        for (j, logits) in (first..).zip(all.chunks_exact(vocab)) {
             // -log softmax(logits)[target], subtracting the max first.
             let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let sum: f64 = logits.iter().map(|l| ((l - max) as f64).exp()).sum();
@@ -273,21 +271,18 @@ fn dump(args: &DumpArgs) -> Result<()> {
 
     let mut traced: BTreeMap<String, Vec<f32>> = BTreeMap::new();
     let mut state = model.new_state(tokens.len() + args.r#gen);
-    let mut logits = Vec::new();
-    for token in &tokens {
-        logits = model.forward(&mut state, *token, &mut |name, data| {
-            if !args.logits_only {
-                traced
-                    .entry(name.to_string())
-                    .or_default()
-                    .extend_from_slice(data);
-            }
-        });
-        traced
-            .entry("logits".into())
-            .or_default()
-            .extend_from_slice(&logits);
-    }
+    anyhow::ensure!(!tokens.is_empty(), "empty prompt");
+    let mut record = |name: &str, data: &[f32]| {
+        traced.insert(name.to_string(), data.to_vec());
+    };
+    let trace: Option<engine::model::Trace> = if args.logits_only {
+        None
+    } else {
+        Some(&mut record)
+    };
+    let all = model.forward(&mut state, &tokens, 0, trace);
+    let mut logits = all[all.len() - model.config.vocab_size..].to_vec();
+    traced.insert("logits".into(), all);
 
     let mut gen_tokens = Vec::new();
     let mut gen_logits = Vec::new();
@@ -296,7 +291,7 @@ fn dump(args: &DumpArgs) -> Result<()> {
         gen_tokens.push(token);
         gen_logits.extend_from_slice(&logits);
         if step + 1 < args.r#gen {
-            logits = model.forward(&mut state, token, &mut |_, _| {});
+            logits = model.forward(&mut state, &[token], 0, None);
         }
     }
 

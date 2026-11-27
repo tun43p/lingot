@@ -1,9 +1,9 @@
-//! Scalar f32 CPU backend: the correctness reference. Readable first; only `matvec` is
-//! parallel (rayon over rows) so the tests do not take minutes.
+//! Scalar f32 CPU backend: the correctness reference. Readable first; only `matmul` is
+//! parallel (rayon over output values) so the tests do not take minutes.
 
 use rayon::prelude::*;
 
-use super::{Backend, Weight};
+use super::{AttentionShape, Backend, Weight};
 use crate::gguf::TensorType;
 
 pub struct Cpu;
@@ -134,95 +134,142 @@ fn dot(ty: TensorType, row: &[u8], x: &[f32]) -> f32 {
 }
 
 impl Backend for Cpu {
-    fn embed(&self, w: &Weight, token: u32, out: &mut [f32]) {
+    type Buf = Vec<f32>;
+    type Weights<'a> = Weight<'a>;
+
+    fn weights<'a>(&self, w: Weight<'a>) -> Weight<'a> {
+        w
+    }
+
+    fn alloc(&self, len: usize) -> Vec<f32> {
+        vec![0.0; len]
+    }
+
+    fn upload(&self, data: &[f32]) -> Vec<f32> {
+        data.to_vec()
+    }
+
+    fn read(&self, buf: &Vec<f32>) -> Vec<f32> {
+        buf.clone()
+    }
+
+    fn slice(&self, buf: &Vec<f32>, start: usize, len: usize) -> Vec<f32> {
+        buf[start..start + len].to_vec()
+    }
+
+    fn embed(&self, w: &Weight, tokens: &[u32], out: &mut Vec<f32>) {
         let size = row_bytes(w.ty, w.cols);
-        let row = token as usize;
-        assert!(row < w.rows && out.len() == w.cols);
-        decode_row(w.ty, &w.data[row * size..(row + 1) * size], out);
-    }
-
-    fn matvec(&self, w: &Weight, x: &[f32], out: &mut [f32]) {
-        assert!(x.len() == w.cols && out.len() == w.rows);
-        out.par_iter_mut()
-            .zip(w.data.par_chunks_exact(row_bytes(w.ty, w.cols)))
-            .for_each(|(o, row)| *o = dot(w.ty, row, x));
-    }
-
-    fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
-        assert!(x.len() == weight.len() && x.len() == out.len());
-        let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
-        let scale = 1.0 / (mean_sq + eps).sqrt();
-        for ((o, x), w) in out.iter_mut().zip(x).zip(weight) {
-            *o = x * scale * w;
+        assert!(out.len() == tokens.len() * w.cols);
+        for (token, out) in tokens.iter().zip(out.chunks_exact_mut(w.cols)) {
+            let row = *token as usize;
+            assert!(row < w.rows);
+            decode_row(w.ty, &w.data[row * size..(row + 1) * size], out);
         }
     }
 
-    fn rope(&self, x: &mut [f32], head_dim: usize, pos: usize, freq_base: f32) {
+    fn matmul(&self, w: &Weight, x: &Vec<f32>, out: &mut Vec<f32>) {
+        let size = row_bytes(w.ty, w.cols);
+        assert!(x.len().is_multiple_of(w.cols) && out.len() == x.len() / w.cols * w.rows);
+        out.par_iter_mut().enumerate().for_each(|(i, o)| {
+            let (t, r) = (i / w.rows, i % w.rows);
+            let row = &w.data[r * size..(r + 1) * size];
+            *o = dot(w.ty, row, &x[t * w.cols..(t + 1) * w.cols]);
+        });
+    }
+
+    fn rms_norm(&self, x: &Vec<f32>, weight: &Vec<f32>, eps: f32, out: &mut Vec<f32>) {
+        let n = weight.len();
+        assert!(x.len().is_multiple_of(n) && x.len() == out.len());
+        for (x, out) in x.chunks_exact(n).zip(out.chunks_exact_mut(n)) {
+            let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+            let scale = 1.0 / (mean_sq + eps).sqrt();
+            for ((o, x), w) in out.iter_mut().zip(x).zip(weight) {
+                *o = x * scale * w;
+            }
+        }
+    }
+
+    fn rope(&self, x: &mut Vec<f32>, n: usize, head_dim: usize, pos: usize, freq_base: f32) {
         let half = head_dim / 2;
-        for head in x.chunks_exact_mut(head_dim) {
-            let (lo, hi) = head.split_at_mut(half);
-            for i in 0..half {
-                let inv_freq = 1.0 / freq_base.powf(2.0 * i as f32 / head_dim as f32);
-                let (sin, cos) = (pos as f32 * inv_freq).sin_cos();
-                let (a, b) = (lo[i], hi[i]);
-                lo[i] = a * cos - b * sin;
-                hi[i] = b * cos + a * sin;
+        let per_token = x.len() / n;
+        for (t, token) in x.chunks_exact_mut(per_token).enumerate() {
+            for head in token.chunks_exact_mut(head_dim) {
+                let (lo, hi) = head.split_at_mut(half);
+                for i in 0..half {
+                    let inv_freq = 1.0 / freq_base.powf(2.0 * i as f32 / head_dim as f32);
+                    let (sin, cos) = ((pos + t) as f32 * inv_freq).sin_cos();
+                    let (a, b) = (lo[i], hi[i]);
+                    lo[i] = a * cos - b * sin;
+                    hi[i] = b * cos + a * sin;
+                }
             }
         }
     }
 
     fn attention(
         &self,
-        q: &[f32],
-        k: &[f32],
-        v: &[f32],
-        n_head: usize,
-        n_head_kv: usize,
-        head_dim: usize,
-        out: &mut [f32],
+        shape: AttentionShape,
+        q: &Vec<f32>,
+        k: &Vec<f32>,
+        v: &Vec<f32>,
+        k_cache: &mut Vec<f32>,
+        v_cache: &mut Vec<f32>,
+        out: &mut Vec<f32>,
     ) {
+        let AttentionShape {
+            pos,
+            n_head,
+            n_head_kv,
+            head_dim,
+        } = shape;
         let step = n_head_kv * head_dim; // one cached position
-        let n_pos = k.len() / step;
-        assert!(q.len() == n_head * head_dim && out.len() == q.len() && k.len() == v.len());
+        let n = k.len() / step;
+        assert!(q.len() == n * n_head * head_dim && out.len() == q.len() && k.len() == v.len());
+        k_cache[pos * step..(pos + n) * step].copy_from_slice(k);
+        v_cache[pos * step..(pos + n) * step].copy_from_slice(v);
+
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let mut scores = vec![0.0f32; n_pos];
+        let mut scores = vec![0.0f32; pos + n];
+        for t in 0..n {
+            let scores = &mut scores[..pos + t + 1]; // causal: up to the token's own position
+            for h in 0..n_head {
+                let at = (t * n_head + h) * head_dim;
+                let q = &q[at..at + head_dim];
+                let kv = h / (n_head / n_head_kv) * head_dim; // offset of the shared K/V head
+                for (p, score) in scores.iter_mut().enumerate() {
+                    let k = &k_cache[p * step + kv..p * step + kv + head_dim];
+                    *score = q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale;
+                }
 
-        for h in 0..n_head {
-            let q = &q[h * head_dim..(h + 1) * head_dim];
-            let kv = h / (n_head / n_head_kv) * head_dim; // offset of the shared K/V head
-            for (p, score) in scores.iter_mut().enumerate() {
-                let k = &k[p * step + kv..p * step + kv + head_dim];
-                *score = q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale;
-            }
+                // Softmax, subtracting the max first so the exponential cannot overflow.
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut total = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - max).exp();
+                    total += *s;
+                }
 
-            // Softmax, subtracting the max first so the exponential cannot overflow.
-            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut total = 0.0f32;
-            for s in scores.iter_mut() {
-                *s = (*s - max).exp();
-                total += *s;
-            }
-
-            let out = &mut out[h * head_dim..(h + 1) * head_dim];
-            out.fill(0.0);
-            for (p, s) in scores.iter().enumerate() {
-                let weight = s / total;
-                let v = &v[p * step + kv..p * step + kv + head_dim];
-                for (o, v) in out.iter_mut().zip(v) {
-                    *o += weight * v;
+                let out = &mut out[at..at + head_dim];
+                out.fill(0.0);
+                for (p, s) in scores.iter().enumerate() {
+                    let weight = s / total;
+                    let v = &v_cache[p * step + kv..p * step + kv + head_dim];
+                    for (o, v) in out.iter_mut().zip(v) {
+                        *o += weight * v;
+                    }
                 }
             }
         }
     }
 
-    fn silu_mul(&self, gate: &[f32], up: &[f32], out: &mut [f32]) {
+    fn silu_mul(&self, gate: &Vec<f32>, up: &Vec<f32>, out: &mut Vec<f32>) {
         assert!(gate.len() == up.len() && gate.len() == out.len());
         for ((o, g), u) in out.iter_mut().zip(gate).zip(up) {
             *o = g / (1.0 + (-g).exp()) * u;
         }
     }
 
-    fn add(&self, x: &mut [f32], y: &[f32]) {
+    fn add(&self, x: &mut Vec<f32>, y: &Vec<f32>) {
         assert!(x.len() == y.len());
         for (x, y) in x.iter_mut().zip(y) {
             *x += y;

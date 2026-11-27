@@ -69,7 +69,7 @@ pub struct Stats {
 
 pub struct Session<'m, 'g, B: Backend> {
     model: &'m Model<'g, B>,
-    state: State,
+    state: State<B>,
     /// Tokens currently in the KV cache.
     cached: Vec<u32>,
     stop_tokens: Vec<u32>,
@@ -114,11 +114,12 @@ impl<'m, 'g, B: Backend> Session<'m, 'g, B> {
         self.state.truncate(keep);
         self.cached.truncate(keep);
 
-        let mut logits = Vec::new();
-        for token in &prompt[keep..] {
-            logits = self.model.forward(&mut self.state, *token, &mut |_, _| {});
-            self.cached.push(*token);
-        }
+        // Prefill: the rest of the prompt in one batch; only the last token's logits matter.
+        let rest = &prompt[keep..];
+        let mut logits = self
+            .model
+            .forward(&mut self.state, rest, rest.len() - 1, None);
+        self.cached.extend_from_slice(rest);
         let prefill_secs = start.elapsed().as_secs_f64();
 
         let mut generated_tokens = 0;
@@ -139,7 +140,7 @@ impl<'m, 'g, B: Backend> Session<'m, 'g, B> {
             if self.state.pos() == self.state.n_ctx() {
                 break StopReason::ContextFull;
             }
-            logits = self.model.forward(&mut self.state, token, &mut |_, _| {});
+            logits = self.model.forward(&mut self.state, &[token], 0, None);
             self.cached.push(token);
         };
 
