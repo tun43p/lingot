@@ -23,6 +23,7 @@ pub struct Tokenizer {
     merges: HashMap<(u32, u32), (u32, u32)>,
     /// Control and user-defined tokens, longest first: matched whole, never through BPE.
     specials: Vec<(String, u32)>,
+    stop_tokens: Vec<u32>,
     nfc: bool,
 }
 
@@ -96,6 +97,21 @@ impl Tokenizer {
         }
         specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then(a.1.cmp(&b.1)));
 
+        // End-of-generation tokens: the declared EOS plus the ChatML end markers, whose ids
+        // come from the vocabulary. Qwen declares only one of the two as EOS.
+        let mut stop_tokens = Vec::new();
+        if let Some(v) = g.get("tokenizer.ggml.eos_token_id") {
+            let key = "tokenizer.ggml.eos_token_id";
+            stop_tokens.push(v.as_u64().ok_or_else(|| Error::Metadata(key.into()))? as u32);
+        }
+        for name in ["<|im_end|>", "<|endoftext|>"] {
+            if let Some((_, id)) = specials.iter().find(|(s, _)| s == name) {
+                stop_tokens.push(*id);
+            }
+        }
+        stop_tokens.sort();
+        stop_tokens.dedup();
+
         let mut byte_ids = [0u32; 256];
         for b in 0..=255u8 {
             let mut buf = [0u8; 4];
@@ -121,8 +137,14 @@ impl Tokenizer {
             byte_ids,
             merges,
             specials,
+            stop_tokens,
             nfc,
         })
+    }
+
+    /// Tokens that end a generation.
+    pub fn stop_tokens(&self) -> &[u32] {
+        &self.stop_tokens
     }
 
     pub fn vocab_size(&self) -> usize {

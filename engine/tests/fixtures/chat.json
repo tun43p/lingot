@@ -1,0 +1,182 @@
+[
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello!"
+   }
+  ],
+  "think": true,
+  "text": "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello!"
+   }
+  ],
+  "think": false,
+  "text": "<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a pirate."
+   },
+   {
+    "role": "user",
+    "content": "Who are you?"
+   }
+  ],
+  "think": true,
+  "text": "<|im_start|>system\nYou are a pirate.<|im_end|>\n<|im_start|>user\nWho are you?<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are a pirate."
+   },
+   {
+    "role": "user",
+    "content": "Who are you?"
+   }
+  ],
+  "think": false,
+  "text": "<|im_start|>system\nYou are a pirate.<|im_end|>\n<|im_start|>user\nWho are you?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "4"
+   },
+   {
+    "role": "user",
+    "content": "And 3+3?"
+   }
+  ],
+  "think": true,
+  "text": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "4"
+   },
+   {
+    "role": "user",
+    "content": "And 3+3?"
+   }
+  ],
+  "think": false,
+  "text": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\nSimple addition.\n</think>\n\n4"
+   },
+   {
+    "role": "user",
+    "content": "And 3+3?"
+   }
+  ],
+  "think": true,
+  "text": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\nSimple addition.\n</think>\n\n4"
+   },
+   {
+    "role": "user",
+    "content": "And 3+3?"
+   }
+  ],
+  "think": false,
+  "text": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief.\nNo emojis."
+   },
+   {
+    "role": "user",
+    "content": "Bonjour, ça va ?"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\n\n</think>\n\nOui, et toi ?"
+   },
+   {
+    "role": "user",
+    "content": "Très bien 🎉"
+   },
+   {
+    "role": "assistant",
+    "content": "Parfait."
+   },
+   {
+    "role": "user",
+    "content": "  spaces and\n\nnewlines kept  "
+   }
+  ],
+  "think": true,
+  "text": "<|im_start|>system\nBe brief.\nNo emojis.<|im_end|>\n<|im_start|>user\nBonjour, ça va ?<|im_end|>\n<|im_start|>assistant\nOui, et toi ?<|im_end|>\n<|im_start|>user\nTrès bien 🎉<|im_end|>\n<|im_start|>assistant\nParfait.<|im_end|>\n<|im_start|>user\n  spaces and\n\nnewlines kept  <|im_end|>\n<|im_start|>assistant\n"
+ },
+ {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief.\nNo emojis."
+   },
+   {
+    "role": "user",
+    "content": "Bonjour, ça va ?"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\n\n</think>\n\nOui, et toi ?"
+   },
+   {
+    "role": "user",
+    "content": "Très bien 🎉"
+   },
+   {
+    "role": "assistant",
+    "content": "Parfait."
+   },
+   {
+    "role": "user",
+    "content": "  spaces and\n\nnewlines kept  "
+   }
+  ],
+  "think": false,
+  "text": "<|im_start|>system\nBe brief.\nNo emojis.<|im_end|>\n<|im_start|>user\nBonjour, ça va ?<|im_end|>\n<|im_start|>assistant\nOui, et toi ?<|im_end|>\n<|im_start|>user\nTrès bien 🎉<|im_end|>\n<|im_start|>assistant\nParfait.<|im_end|>\n<|im_start|>user\n  spaces and\n\nnewlines kept  <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ }
+]

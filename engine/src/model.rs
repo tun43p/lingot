@@ -26,12 +26,29 @@ pub struct Model<'a, B: Backend> {
     output: Weight<'a>,
 }
 
-/// KV cache: per layer, K and V of every position seen so far, `[position][n_head_kv][head_dim]`.
-#[derive(Default)]
+/// KV cache: per layer, K and V buffers preallocated for `n_ctx` positions and indexed by
+/// position, `[position][n_head_kv][head_dim]`. Only the first `pos` positions are valid.
 pub struct State {
     k: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
     pos: usize,
+    n_ctx: usize,
+}
+
+impl State {
+    /// Number of positions in the cache.
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+
+    pub fn n_ctx(&self) -> usize {
+        self.n_ctx
+    }
+
+    /// Forget everything from position `pos` on.
+    pub fn truncate(&mut self, pos: usize) {
+        self.pos = self.pos.min(pos);
+    }
 }
 
 impl<'a, B: Backend> Model<'a, B> {
@@ -123,11 +140,16 @@ impl<'a, B: Backend> Model<'a, B> {
         })
     }
 
-    pub fn new_state(&self) -> State {
+    /// A KV cache for at most `n_ctx` positions (capped by the model's context length).
+    pub fn new_state(&self, n_ctx: usize) -> State {
+        let c = &self.config;
+        let n_ctx = n_ctx.min(c.context_length);
+        let size = n_ctx * c.head_count_kv * c.key_length;
         State {
-            k: vec![Vec::new(); self.layers.len()],
-            v: vec![Vec::new(); self.layers.len()],
+            k: vec![vec![0.0; size]; self.layers.len()],
+            v: vec![vec![0.0; size]; self.layers.len()],
             pos: 0,
+            n_ctx,
         }
     }
 
@@ -142,7 +164,7 @@ impl<'a, B: Backend> Model<'a, B> {
     ) -> Vec<f32> {
         let (c, b) = (&self.config, &self.backend);
         let (d, hd, eps) = (c.embedding_length, c.key_length, c.rms_norm_eps);
-        assert!(state.pos < c.context_length, "context length exceeded");
+        assert!(state.pos < state.n_ctx, "context length exceeded");
         assert!(
             (token as usize) < c.vocab_size,
             "token {token} out of vocabulary"
@@ -184,12 +206,13 @@ impl<'a, B: Backend> Model<'a, B> {
             trace(&format!("l{i:02}.q_rope"), &q);
             trace(&format!("l{i:02}.k_rope"), &k);
 
-            state.k[i].extend_from_slice(&k);
-            state.v[i].extend_from_slice(&v);
+            let (start, end) = (state.pos * k.len(), (state.pos + 1) * k.len());
+            state.k[i][start..end].copy_from_slice(&k);
+            state.v[i][start..end].copy_from_slice(&v);
             b.attention(
                 &q,
-                &state.k[i],
-                &state.v[i],
+                &state.k[i][..end],
+                &state.v[i][..end],
                 c.head_count,
                 c.head_count_kv,
                 hd,
