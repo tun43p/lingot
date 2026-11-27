@@ -5,3 +5,6 @@ models/
 target/
 
 CLAUDE.md
+.venv/
+vendor/
+ref/dumps/
